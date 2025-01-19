@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package netutils
@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
-	"github.com/daeuniverse/softwind/netproxy"
-	"github.com/daeuniverse/softwind/pkg/fastrand"
-	"github.com/daeuniverse/softwind/pool"
+	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/pkg/fastrand"
+	"github.com/daeuniverse/outbound/pool"
 	dnsmessage "github.com/miekg/dns"
 )
 
@@ -27,7 +27,7 @@ var (
 	systemDns                netip.AddrPort
 	systemDnsNextUpdateAfter time.Time
 
-	BadDnsAnsError = fmt.Errorf("bad dns answer")
+	ErrBadDnsAns = fmt.Errorf("bad dns answer")
 
 	BootstrapDns = netip.MustParseAddrPort("208.67.222.222:5353")
 )
@@ -59,10 +59,6 @@ func tryUpdateSystemDnsElapse(k time.Duration) (err error) {
 
 func tryUpdateSystemDns() (err error) {
 	dnsConf := dnsReadConfig("/etc/resolv.conf")
-	if len(dnsConf.servers) == 0 {
-		err = fmt.Errorf("no valid dns server in /etc/resolv.conf")
-		return err
-	}
 	systemDns = netip.AddrPort{}
 	for _, s := range dnsConf.servers {
 		ipPort := netip.MustParseAddrPort(s)
@@ -107,13 +103,13 @@ func ResolveNetip(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, ho
 		case dnsmessage.TypeA:
 			a, ok := ans.(*dnsmessage.A)
 			if !ok {
-				return nil, BadDnsAnsError
+				return nil, ErrBadDnsAns
 			}
 			ip, okk = netip.AddrFromSlice(a.A)
 		case dnsmessage.TypeAAAA:
 			a, ok := ans.(*dnsmessage.AAAA)
 			if !ok {
-				return nil, BadDnsAnsError
+				return nil, ErrBadDnsAns
 			}
 			ip, okk = netip.AddrFromSlice(a.AAAA)
 		}
@@ -137,7 +133,7 @@ func ResolveNS(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host 
 		}
 		ns, ok := ans.(*dnsmessage.NS)
 		if !ok {
-			return nil, BadDnsAnsError
+			return nil, ErrBadDnsAns
 		}
 		records = append(records, ns.Ns)
 	}
@@ -211,8 +207,7 @@ func resolve(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host st
 	}
 
 	// Dial and write.
-	cd := &netproxy.ContextDialerConverter{Dialer: d}
-	c, err := cd.DialContext(ctx, network, dns.String())
+	c, err := d.DialContext(ctx, network, dns.String())
 	if err != nil {
 		return nil, err
 	}

@@ -1,42 +1,43 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package control
 
 import (
-	"encoding/binary"
-	"errors"
 	"fmt"
 	"net"
 	"net/netip"
-	"syscall"
+
 	"time"
-	"unsafe"
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
 	ob "github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/component/sniffing"
-	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
-	"github.com/daeuniverse/softwind/pkg/zeroalloc/buffer"
+	"github.com/daeuniverse/outbound/pool"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 )
 
-const (
+var (
 	DefaultNatTimeout = 3 * time.Minute
-	DnsNatTimeout     = 17 * time.Second // RFC 5452
-	MaxRetry          = 2
+)
+
+const (
+	DnsNatTimeout  = 17 * time.Second // RFC 5452
+	AnyfromTimeout = 5 * time.Second  // Do not cache too long.
+	MaxRetry       = 2
 )
 
 type DialOption struct {
-	Target   string
-	Dialer   *dialer.Dialer
-	Outbound *ob.DialerGroup
-	Network  string
+	Target        string
+	Dialer        *dialer.Dialer
+	Outbound      *ob.DialerGroup
+	Network       string
+	SniffedDomain string
 }
 
 func ChooseNatTimeout(data []byte, sniffDns bool) (dmsg *dnsmessage.Msg, timeout time.Duration) {
@@ -50,101 +51,99 @@ func ChooseNatTimeout(data []byte, sniffDns bool) (dmsg *dnsmessage.Msg, timeout
 	return nil, DefaultNatTimeout
 }
 
-func ParseAddrHdr(data []byte) (hdr *bpfDstRoutingResult, dataOffset int, err error) {
-	dataOffset = int(unsafe.Sizeof(bpfDstRoutingResult{}))
-	if len(data) < dataOffset {
-		return nil, 0, fmt.Errorf("data is too short to parse AddrHdr")
-	}
-	_hdr := *(*bpfDstRoutingResult)(unsafe.Pointer(&data[0]))
-	if _hdr.Recognize != consts.Recognize {
-		return nil, 0, fmt.Errorf("bad recognize")
-	}
-	_hdr.Port = common.Ntohs(_hdr.Port)
-	return &_hdr, dataOffset, nil
-}
-
-func sendPktWithHdrWithFlag(data []byte, realFrom netip.AddrPort, lConn *net.UDPConn, to netip.AddrPort, lanWanFlag consts.LanWanFlag) error {
-	realFrom16 := realFrom.Addr().As16()
-	hdr := bpfDstRoutingResult{
-		Ip:   common.Ipv6ByteSliceToUint32Array(realFrom16[:]),
-		Port: common.Htons(realFrom.Port()),
-		RoutingResult: bpfRoutingResult{
-			Outbound: uint8(lanWanFlag), // Pass some message to the kernel program.
-		},
-	}
-	// Do not put this 'buf' because it has been taken by buffer.
-	b := buffer.NewBuffer(int(unsafe.Sizeof(hdr)) + len(data))
-	defer b.Put()
-	// Use internal.NativeEndian due to already big endian.
-	if err := binary.Write(b, internal.NativeEndian, hdr); err != nil {
-		return err
-	}
-	b.Write(data)
-	//logrus.Debugln("sendPktWithHdrWithFlag: from", realFrom, "to", to)
-	if ipversion := consts.IpVersionFromAddr(to.Addr()); consts.IpVersionFromAddr(lConn.LocalAddr().(*net.UDPAddr).AddrPort().Addr()) != ipversion {
-		// ip versions unmatched.
-		if ipversion == consts.IpVersionStr_4 {
-			// 4 to 6
-			to = netip.AddrPortFrom(netip.AddrFrom16(to.Addr().As16()), to.Port())
-		} else {
-			// Shouldn't happen.
-			return fmt.Errorf("unmatched ipversions")
-		}
-	}
-	_, err := lConn.WriteToUDPAddrPort(b.Bytes(), to)
-	return err
-}
-
 // sendPkt uses bind first, and fallback to send hdr if addr is in use.
-func sendPkt(data []byte, from netip.AddrPort, realTo, to netip.AddrPort, lConn *net.UDPConn, lanWanFlag consts.LanWanFlag) (err error) {
-
-	if lanWanFlag == consts.LanWanFlag_IsWan {
-		return sendPktWithHdrWithFlag(data, from, lConn, to, lanWanFlag)
-	}
-
-	d := net.Dialer{Control: func(network, address string, c syscall.RawConn) error {
-		return dialer.BindControl(c, from)
-	}}
-	var conn net.Conn
-	conn, err = d.Dial("udp", realTo.String())
+func sendPkt(log *logrus.Logger, data []byte, from netip.AddrPort, realTo, to netip.AddrPort, lConn *net.UDPConn) (err error) {
+	uConn, _, err := DefaultAnyfromPool.GetOrCreate(from.String(), AnyfromTimeout)
 	if err != nil {
-		if errors.Is(err, syscall.EADDRINUSE) {
-			// Port collision, use traditional method.
-			return sendPktWithHdrWithFlag(data, from, lConn, to, lanWanFlag)
-		}
-		return err
+		return
 	}
-	defer conn.Close()
-	uConn := conn.(*net.UDPConn)
-	_, err = uConn.Write(data)
+	_, err = uConn.WriteToUDPAddrPort(data, realTo)
 	return err
 }
 
-func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, realDst netip.AddrPort, routingResult *bpfRoutingResult) (err error) {
-	var lanWanFlag consts.LanWanFlag
+func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, realDst netip.AddrPort, routingResult *bpfRoutingResult, skipSniffing bool) (err error) {
 	var realSrc netip.AddrPort
 	var domain string
-	useAssign := pktDst == realDst // Use sk_assign instead of modify target ip/port.
-	if useAssign {
-		lanWanFlag = consts.LanWanFlag_IsLan
-		realSrc = src
-	} else {
-		lanWanFlag = consts.LanWanFlag_IsWan
-		// From localhost, so dst IP is src IP.
-		realSrc = netip.AddrPortFrom(pktDst.Addr(), src.Port())
+	realSrc = src
+	ue, ueExists := DefaultUdpEndpointPool.Get(realSrc)
+	if ueExists && ue.SniffedDomain != "" {
+		// It is quic ...
+		// Fast path.
+		domain := ue.SniffedDomain
+		dialTarget := realDst.String()
+
+		if c.log.IsLevelEnabled(logrus.TraceLevel) {
+			fields := logrus.Fields{
+				"network":  "udp(fp)",
+				"outbound": ue.Outbound.Name,
+				"policy":   ue.Outbound.GetSelectionPolicy(),
+				"dialer":   ue.Dialer.Property().Name,
+				"sniffed":  domain,
+				"ip":       RefineAddrPortToShow(realDst),
+				"pid":      routingResult.Pid,
+				"dscp":     routingResult.Dscp,
+				"pname":    ProcessName2String(routingResult.Pname[:]),
+				"mac":      Mac2String(routingResult.Mac[:]),
+			}
+			c.log.WithFields(fields).Tracef("%v <-> %v", RefineSourceToShow(realSrc, realDst.Addr()), dialTarget)
+		}
+
+		_, err = ue.WriteTo(data, dialTarget)
+		if err != nil {
+			return err
+		}
+		return nil
 	}
 
 	// To keep consistency with kernel program, we only sniff DNS request sent to 53.
 	dnsMessage, natTimeout := ChooseNatTimeout(data, realDst.Port() == 53)
 	// We should cache DNS records and set record TTL to 0, in order to monitor the dns req and resp in real time.
 	isDns := dnsMessage != nil
-	if !isDns {
+	if !isDns && !skipSniffing && !ueExists {
 		// Sniff Quic, ...
-		sniffer := sniffing.NewPacketSniffer(data)
-		defer sniffer.Close()
-		domain, err = sniffer.SniffUdp()
-		if err != nil && !sniffing.IsSniffingError(err) {
-			return err
+		key := PacketSnifferKey{
+			LAddr: realSrc,
+			RAddr: realDst,
+		}
+		_sniffer, _ := DefaultPacketSnifferSessionMgr.GetOrCreate(key, nil)
+		_sniffer.Mu.Lock()
+		// Re-get sniffer from pool to confirm the transaction is not done.
+		sniffer := DefaultPacketSnifferSessionMgr.Get(key)
+		if _sniffer == sniffer {
+			sniffer.AppendData(data)
+			domain, err = sniffer.SniffUdp()
+			if err != nil && !sniffing.IsSniffingError(err) {
+				sniffer.Mu.Unlock()
+				return err
+			}
+			if sniffer.NeedMore() {
+				sniffer.Mu.Unlock()
+				return nil
+			}
+			if err != nil {
+				logrus.WithError(err).
+					WithField("from", realSrc).
+					WithField("to", realDst).
+					Trace("sniffUdp")
+			}
+			defer DefaultPacketSnifferSessionMgr.Remove(key, sniffer)
+			// Re-handlePkt after self func.
+			toRehandle := sniffer.Data()[1 : len(sniffer.Data())-1] // Skip the first empty and the last (self).
+			sniffer.Mu.Unlock()
+			if len(toRehandle) > 0 {
+				defer func() {
+					if err == nil {
+						for _, d := range toRehandle {
+							dCopy := pool.Get(len(d))
+							copy(dCopy, d)
+							go c.handlePkt(lConn, dCopy, src, pktDst, realDst, routingResult, true)
+						}
+					}
+				}()
+			}
+		} else {
+			_sniffer.Mu.Unlock()
+			// sniffer may be nil.
 		}
 	}
 	if routingResult.Must > 0 {
@@ -155,7 +154,6 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 	}
 	if isDns {
 		return c.dnsController.Handle_(dnsMessage, &udpRequest{
-			lanWanFlag:    lanWanFlag,
 			realSrc:       realSrc,
 			realDst:       realDst,
 			src:           src,
@@ -170,7 +168,6 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 	//		However, games may not use QUIC for communication, thus we cannot use domain to dial, which is fine.
 
 	// Get udp endpoint.
-	var ue *UdpEndpoint
 	retry := 0
 	networkType := &dialer.NetworkType{
 		L4Proto:   consts.L4ProtoStr_UDP,
@@ -179,11 +176,22 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 	}
 	// Get outbound.
 	outboundIndex := consts.OutboundIndex(routingResult.Outbound)
-	dialTarget, shouldReroute, dialIp := c.ChooseDialTarget(outboundIndex, realDst, domain)
+	var (
+		dialTarget    string
+		shouldReroute bool
+		dialIp        bool
+	)
+	_, shouldReroute, _ = c.ChooseDialTarget(outboundIndex, realDst, domain)
+	// Do not overwrite target.
+	// This fixes a problem that quic connection to google servers.
+	// Reproduce:
+	// docker run --rm --name curl-http3 ymuski/curl-http3 curl --http3 -o /dev/null -v -L https://i.ytimg.com
+	dialTarget = realDst.String()
+	dialIp = true
 getNew:
 	if retry > MaxRetry {
 		c.log.WithFields(logrus.Fields{
-			"src":     RefineSourceToShow(realSrc, realDst.Addr(), lanWanFlag),
+			"src":     RefineSourceToShow(realSrc, realDst.Addr()),
 			"network": networkType.String(),
 			"dialer":  ue.Dialer.Property().Name,
 			"retry":   retry,
@@ -194,7 +202,7 @@ getNew:
 		// Handler handles response packets and send it to the client.
 		Handler: func(data []byte, from netip.AddrPort) (err error) {
 			// Do not return conn-unrelated err in this func.
-			return sendPkt(data, from, realSrc, src, lConn, lanWanFlag)
+			return sendPkt(c.log, data, from, realSrc, src, lConn)
 		},
 		NatTimeout: natTimeout,
 		GetDialOption: func() (option *DialOption, err error) {
@@ -220,8 +228,10 @@ getNew:
 						outboundIndex.String(),
 					)
 				}
-				// Reset dialTarget.
-				dialTarget, _, dialIp = c.ChooseDialTarget(outboundIndex, realDst, domain)
+				// Do not overwrite target.
+				// This fixes quic problem from google.
+				// Reproduce:
+				// docker run --rm --name curl-http3 ymuski/curl-http3 curl --http3 -o /dev/null -v -L https://i.ytimg.com
 			default:
 			}
 
@@ -240,10 +250,11 @@ getNew:
 				return nil, fmt.Errorf("failed to select dialer from group %v (%v, dns?:%v,from: %v): %w", outbound.Name, networkType.StringWithoutDns(), isDns, realSrc.String(), err)
 			}
 			return &DialOption{
-				Target:   dialTarget,
-				Dialer:   dialerForNew,
-				Outbound: outbound,
-				Network:  common.MagicNetwork("udp", routingResult.Mark),
+				Target:        dialTarget,
+				Dialer:        dialerForNew,
+				Outbound:      outbound,
+				Network:       common.MagicNetwork("udp", routingResult.Mark, c.mptcp),
+				SniffedDomain: domain,
 			}, nil
 		},
 	})
@@ -256,7 +267,7 @@ getNew:
 
 		if c.log.IsLevelEnabled(logrus.DebugLevel) {
 			c.log.WithFields(logrus.Fields{
-				"src":     RefineSourceToShow(realSrc, realDst.Addr(), lanWanFlag),
+				"src":     RefineSourceToShow(realSrc, realDst.Addr()),
 				"network": networkType.String(),
 				"dialer":  ue.Dialer.Property().Name,
 				"retry":   retry,
@@ -265,6 +276,10 @@ getNew:
 		_ = DefaultUdpEndpointPool.Remove(realSrc, ue)
 		retry++
 		goto getNew
+	}
+	if domain == "" {
+		// It is used for showing.
+		domain = ue.SniffedDomain
 	}
 
 	_, err = ue.WriteTo(data, dialTarget)
@@ -290,20 +305,24 @@ getNew:
 
 	// Print log.
 	// Only print routing for new connection to avoid the log exploded (Quic and BT).
-	if isNew && c.log.IsLevelEnabled(logrus.InfoLevel) || c.log.IsLevelEnabled(logrus.DebugLevel) {
+	if (isNew && c.log.IsLevelEnabled(logrus.InfoLevel)) || c.log.IsLevelEnabled(logrus.DebugLevel) {
 		fields := logrus.Fields{
 			"network":  networkType.StringWithoutDns(),
 			"outbound": ue.Outbound.Name,
 			"policy":   ue.Outbound.GetSelectionPolicy(),
 			"dialer":   ue.Dialer.Property().Name,
-			"domain":   domain,
+			"sniffed":  domain,
 			"ip":       RefineAddrPortToShow(realDst),
 			"pid":      routingResult.Pid,
 			"dscp":     routingResult.Dscp,
 			"pname":    ProcessName2String(routingResult.Pname[:]),
 			"mac":      Mac2String(routingResult.Mac[:]),
 		}
-		c.log.WithFields(fields).Infof("%v <-> %v", RefineSourceToShow(realSrc, realDst.Addr(), lanWanFlag), dialTarget)
+		logger := c.log.WithFields(fields).Infof
+		if !isNew && c.log.IsLevelEnabled(logrus.DebugLevel) {
+			logger = c.log.WithFields(fields).Debugf
+		}
+		logger("%v <-> %v", RefineSourceToShow(realSrc, realDst.Addr()), dialTarget)
 	}
 
 	return nil

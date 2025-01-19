@@ -1,21 +1,22 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package domain_matcher
 
 import (
 	"fmt"
+	"regexp"
+	"strings"
+
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/pkg/trie"
 	"github.com/sirupsen/logrus"
 	"github.com/v2rayA/ahocorasick-domain"
-	"regexp"
-	"strings"
 )
 
-var ValidDomainChars = trie.NewValidChars([]byte("0123456789abcdefghijklmnopqrstuvwxyz-.^"))
+var ValidDomainChars = trie.NewValidChars([]byte("0123456789abcdefghijklmnopqrstuvwxyz-.^_"))
 
 type AhocorasickSlimtrie struct {
 	log *logrus.Logger
@@ -52,7 +53,7 @@ nextPattern:
 		case consts.RoutingDomainKey_Full:
 			for _, r := range []byte(d) {
 				if !ValidDomainChars.IsValidChar(r) {
-					n.log.Warnf("DomainMatcher: skip bad full domain: %v: unexpected chat: %v", d, r)
+					n.log.Warnf("DomainMatcher: skip bad full domain: %v: unexpected char: %v", d, string(r))
 					continue nextPattern
 				}
 			}
@@ -60,7 +61,7 @@ nextPattern:
 		case consts.RoutingDomainKey_Suffix:
 			for _, r := range []byte(d) {
 				if !ValidDomainChars.IsValidChar(r) {
-					n.log.Warnf("DomainMatcher: skip bad suffix domain: %v: unexpected chat: %v", d, r)
+					n.log.Warnf("DomainMatcher: skip bad suffix domain: %v: unexpected char: %v", d, string(r))
 					continue nextPattern
 				}
 			}
@@ -99,11 +100,12 @@ func (n *AhocorasickSlimtrie) MatchDomainBitmap(domain string) (bitmap []uint32)
 	bitmap = make([]uint32, N)
 	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 	// Domain should consist of 'a'-'z' and '.' and '-'
-	for _, b := range []byte(domain) {
-		if !ahocorasick.IsValidChar(b) {
-			return bitmap
-		}
-	}
+	// NOTE: DO NOT VERIFY THE DOMAIN TO MATCH: https://github.com/daeuniverse/dae/issues/528
+	// for _, b := range []byte(domain) {
+	// 	if !ahocorasick.IsValidChar(b) {
+	// 		return bitmap
+	// 	}
+	// }
 	// Suffix matching.
 	suffixTrieDomain := ToSuffixTrieString("^" + domain)
 	for _, i := range n.validTrieIndexes {
